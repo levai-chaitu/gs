@@ -31,26 +31,10 @@
         <span class="ic" data-icon="corner-up-right"></span> Follow-ups
       </button>
     </nav>
-    <div class="side-foot">
-      <div class="token-card">
-        <label>API Token</label>
-        <input id="token" type="password" placeholder="Paste Bearer token…" autocomplete="off" />
-        <div class="token-row">
-          <button id="saveToken" class="btn btn-primary btn-sm">Save</button>
-          <span id="tokenStatus" class="token-status">no token</span>
-        </div>
-      </div>
-    </div>
   </aside>
 
   <!-- ===================== MAIN ===================== -->
   <div class="content">
-    <header class="topbar">
-      <div></div>
-      <div class="topbar-right">
-        <span class="credits"><span data-icon="coins"></span> Credits: <b id="credits">—</b></span>
-      </div>
-    </header>
 
     <!-- ===================== CREATE VIEW ===================== -->
     <main id="view-create" class="view active">
@@ -103,7 +87,7 @@
             </div>
           </div>
 
-          <div class="card">
+          <div class="card" style="display:none">
             <button id="advToggle" class="adv-head" aria-expanded="true">
               <span><span class="card-ic" data-icon="sliders"></span> Advanced Settings <em>(Optional)</em></span>
               <span id="advChevron" class="chevron" data-icon="chevron-down"></span>
@@ -145,7 +129,7 @@
             </div>
           </div>
 
-          <div class="card">
+          <div class="card" style="display:none">
             <h2><span class="card-ic" data-icon="corner-up-right"></span> Follow-up Rules <em class="muted-em">(Optional)</em></h2>
             <p class="hint" id="followupHint">Automatically place a follow-up call when a collected field meets a condition. Select an agent above to load its collected fields.</p>
             <div id="followupList"></div>
