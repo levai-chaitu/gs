@@ -9,6 +9,7 @@
 const API_BASE = "https://api.levrage.ai/v1";
 const MAX_CONCURRENT = 20; // account slots (no API for this; reference showed ~11)
 const API_TOKEN = "lev_iFeIGO5CboduSWjYOp9ujzZIu_IfF-Z3X_GEg2R6KLI"; // gs pre-sales key
+const SOURCE_NUMBER = "00919240012505"; // hardcoded source/caller number
 
 // Hardcoded follow-up rule applied to every campaign (UI for it is hidden):
 // when interested_to_take_loan == yes, after 30s call the Karnataka follow-up agent.
@@ -25,7 +26,7 @@ const HARDCODED_FOLLOWUP_RULES = [{
 const state = {
   token: API_TOKEN,
   agentId: "",
-  phoneNumber: "",
+  phoneNumber: SOURCE_NUMBER,
   contacts: [],
   columns: [],
   colMap: {},
@@ -236,9 +237,12 @@ function loadNumbers() { const k = numbersKey(); return k ? JSON.parse(localStor
 function saveNumbers(arr) { const k = numbersKey(); if (k) localStorage.setItem(k, JSON.stringify(arr)); }
 function refreshNumberOptions() {
   state.recentNumbers = loadNumbers();
-  phoneCombo.setOptions(state.recentNumbers.map(n => ({ value: n, label: n })));
+  // Always offer the hardcoded source first, then any saved numbers.
+  const nums = [SOURCE_NUMBER, ...state.recentNumbers.filter(n => n !== SOURCE_NUMBER)];
+  phoneCombo.setOptions(nums.map(n => ({ value: n, label: n })));
 }
 refreshNumberOptions();
+phoneCombo.setValue(SOURCE_NUMBER, SOURCE_NUMBER);   // preselect the hardcoded source
 
 const downloadCombo = Combobox($("#downloadCombo"), {
   placeholder: "Download Sample", searchPlaceholder: "Format…",
@@ -588,7 +592,7 @@ async function scanFollowups() {
       const base = new Date(call.ended_at || call.started_at).getTime();
       runs[key] = {
         key, campaignId: cid, callId: call.id,
-        phone: call.phone_number, source_number: configs[cid].source_number,
+        phone: call.phone_number, source_number: SOURCE_NUMBER,
         followup_agent_id: rule.followup_agent_id, followup_agent_name: rule.followup_agent_name,
         reason: `${rule.field} ${opLabel(rule.operator)}${rule.value ? " " + rule.value : ""}`,
         summary: call.call_summary || "", collected: (call.details_collection.collected_values || {}),
@@ -617,7 +621,7 @@ async function processDue() {
 async function sendFollowup(r, runs) {
   try {
     await fireFollowup({
-      followup_agent_id: r.followup_agent_id, source_number: r.source_number, phone_number: r.phone,
+      followup_agent_id: r.followup_agent_id, source_number: r.source_number || SOURCE_NUMBER, phone_number: r.phone,
       metadata: { ...r.collected, followup_reason: r.reason, previous_call_id: r.callId, previous_call_summary: r.summary },
     });
     r.status = "sent"; r.sentAt = Date.now();
