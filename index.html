@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>gupshup.ai — Campaigns</title>
+<title>demo testing</title>
 <link rel="icon" type="image/svg+xml" href="favicon.svg" />
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="styles.css" />
@@ -13,8 +13,8 @@
   <!-- ===================== SIDEBAR ===================== -->
   <aside class="sidebar">
     <div class="brand">
-      <span class="brand-mark"><img class="brand-logo" src="favicon.svg" alt="gupshup.ai" /></span>
-      <span class="brand-name">gupshup<span class="dot">.ai</span></span>
+      <span class="brand-mark"><img class="brand-logo" src="favicon.svg" alt="demo testing" /></span>
+      <span class="brand-name">demo testing</span>
     </div>
     <div class="menu-label">Main Menu</div>
     <nav class="side-nav">
@@ -26,6 +26,9 @@
       </button>
       <button class="side-item" data-view="calls">
         <span class="ic" data-icon="history"></span> Call History
+      </button>
+      <button class="side-item" data-view="followups">
+        <span class="ic" data-icon="corner-up-right"></span> Follow-ups
       </button>
     </nav>
     <div class="side-foot">
@@ -248,6 +251,23 @@
         <div class="table-scroll"><table id="callsTable" class="data-table"></table></div>
         <div id="callsFoot" class="table-foot"></div>
       </div>
+    </main>
+
+    <!-- ===================== FOLLOW-UPS VIEW ===================== -->
+    <main id="view-followups" class="view">
+      <div class="page-head with-actions">
+        <div><h1>Follow-ups</h1><p>Auto-trigger follow-up calls from call analytics, based on your batch rules</p></div>
+        <div class="row">
+          <label class="arm-toggle">
+            <span class="switch"><input id="fuArm" type="checkbox" /><span class="slider"></span></span>
+            Auto-send when due
+          </label>
+          <button id="fuScan" class="btn btn-outline"><span data-icon="refresh"></span> Scan now</button>
+        </div>
+      </div>
+      <div id="fuStatus" class="fu-status"></div>
+      <div id="fuConfigs"></div>
+      <div id="fuRuns" class="campaigns"></div>
     </main>
   </div>
 </div>

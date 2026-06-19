@@ -19,8 +19,12 @@ const state = {
   fileName: "",
   agents: [],
   agentFields: [],   // details_to_collect of the selected batch agent
-  recentNumbers: JSON.parse(localStorage.getItem("levrage_numbers") || "[]"),
+  recentNumbers: [],   // loaded per-account in refreshNumberOptions()
 };
+// Purge legacy global keys (stale/hardcoded values not account-scoped).
+localStorage.removeItem("levrage_numbers");
+localStorage.removeItem("gupshup_followups");
+localStorage.removeItem("gupshup_followup_runs");
 
 // Follow-up condition operators (kept broad — user picks)
 const FU_OPERATORS = [
@@ -192,11 +196,36 @@ function refreshTokenUI() {
   $("#tokenStatus").className = "token-status" + (state.token ? " ok" : "");
 }
 $("#saveToken").addEventListener("click", () => {
-  state.token = $("#token").value.trim();
+  const newTok = $("#token").value.trim();
+  const changed = newTok !== state.token;
+  state.token = newTok;
   localStorage.setItem("levrage_token", state.token);
+  if (changed) resetAccountData();   // different API key ⇒ different account ⇒ wipe & refresh
   refreshTokenUI();
   if (state.token) { loadAgents(); toast("Token saved", "ok"); }
 });
+
+// Wipe all account-scoped data and reset the whole UI (called on API-key change).
+function resetAccountData() {
+  // clear stored account data (source numbers, follow-up configs/runs)
+  localStorage.removeItem("levrage_numbers");
+  // reset in-memory state
+  state.agents = []; state.recentNumbers = [];
+  state.phoneNumber = ""; state.agentId = "";
+  callsCache = [];
+  // reset selectors / inputs
+  agentCombo.setOptions([]); agentCombo.setValue("", "");
+  refreshNumberOptions(); phoneCombo.setValue("", "");
+  resetForm();
+  // clear every view's rendered data
+  $("#campaignsList").innerHTML = "";
+  $("#callsTable").innerHTML = ""; $("#callsFoot").textContent = "";
+  $("#batchBody").innerHTML = ""; $("#batchCredits").textContent = "—";
+  $("#fuConfigs").innerHTML = ""; $("#fuRuns").innerHTML = ""; setFuStatus("");
+  $("#credits").textContent = "—";
+  // back to the create view for a clean slate
+  showView("create", { sidebar: "create" });
+}
 
 /* ============================================================
    View switching (sidebar)
@@ -212,6 +241,7 @@ $$(".side-item").forEach(item => {
     showView(item.dataset.view);
     if (item.dataset.view === "list") loadCampaigns();
     if (item.dataset.view === "calls") loadCalls();
+    if (item.dataset.view === "followups") { renderFollowups(); scanFollowups(); }
   });
 });
 $("#batchBack").addEventListener("click", () => { showView("list", { sidebar: "list" }); loadCampaigns(); });
@@ -227,7 +257,12 @@ const phoneCombo = Combobox($("#phoneCombo"), {
   placeholder: "Select your phone number", searchPlaceholder: "Search or type a number…", editable: true,
   onChange: (v) => { state.phoneNumber = v; validate(); },
 });
+// Source numbers are saved per API key (account-scoped). No hardcoded defaults.
+function numbersKey() { return state.token ? "gs_src_numbers::" + state.token : null; }
+function loadNumbers() { const k = numbersKey(); return k ? JSON.parse(localStorage.getItem(k) || "[]") : []; }
+function saveNumbers(arr) { const k = numbersKey(); if (k) localStorage.setItem(k, JSON.stringify(arr)); }
 function refreshNumberOptions() {
+  state.recentNumbers = loadNumbers();
   phoneCombo.setOptions(state.recentNumbers.map(n => ({ value: n, label: n })));
 }
 refreshNumberOptions();
@@ -251,12 +286,16 @@ async function loadAgents() {
   if (!state.token) return;
   try {
     const res = await api("/agents?page=1&page_size=100");
-    state.agents = res.data || [];
-    agentCombo.setOptions(state.agents.map(a => ({
+    state.agents = res.data || [];   // full list kept for name resolution
+    agentCombo.setOptions(selectableAgents().map(a => ({
       value: a.id, label: a.name,
       sub: [a.language, a.agent_type, a.voice].filter(Boolean).join(" · "),
     })));
   } catch (e) { toast("Agents: " + e.message, "err"); }
+}
+// Only agents whose name contains "karn" are selectable (empty if none).
+function selectableAgents() {
+  return state.agents.filter(a => /karn/i.test(a.name || ""));
 }
 
 /* ============================================================
@@ -377,9 +416,13 @@ function addBlackoutRow(start = "21:00", end = "09:00") {
 }
 
 /* ============================================================
-   Follow-up rules — config UI (fields come from the batch
-   agent's details_to_collect via GET /agents/{id})
+   Follow-up rules — config UI. Field options come from the batch
+   agent's details_to_collect via GET /agents/{id}. All follow-up
+   storage is ACCOUNT-SCOPED (keyed by API token) so it never
+   shows stale data from another account.
    ============================================================ */
+function opLabel(v) { return (FU_OPERATORS.find(o => o.v === v) || {}).label || v; }
+
 async function loadAgentFields(agentId) {
   state.agentFields = [];
   if (agentId) {
@@ -399,11 +442,9 @@ async function loadAgentFields(agentId) {
   $("#followupHint").textContent = !agentId
     ? "Automatically place a follow-up call when a collected field meets a condition. Select an agent above to load its collected fields."
     : has ? "Add one or more rules. When a call's collected field meets the condition, a follow-up call is placed after the chosen delay using the chosen agent."
-          : "This agent has no configured fields to collect, so condition fields can't be loaded. You can still type a field name manually.";
-  // refresh field dropdowns in existing rows
+          : "This agent has no configured fields to collect. You can still type a field name manually.";
   $$("#followupList .fu-rule").forEach(refreshRuleFieldOptions);
 }
-
 function fieldOptionsHtml(selected) {
   if (!state.agentFields.length) return `<option value="">(type field name)</option>`;
   return `<option value="">— field —</option>` + state.agentFields.map(f =>
@@ -420,7 +461,7 @@ function addFollowupRow() {
   const div = document.createElement("div");
   div.className = "fu-rule";
   const opts = FU_OPERATORS.map(o => `<option value="${o.v}">${o.label}</option>`).join("");
-  const agentOpts = `<option value="">— agent —</option>` + state.agents.map(a =>
+  const agentOpts = `<option value="">— agent —</option>` + selectableAgents().map(a =>
     `<option value="${a.id}">${escapeHtml(a.name)}</option>`).join("");
   div.innerHTML = `
     <div class="fu-line">
@@ -448,7 +489,6 @@ function addFollowupRow() {
   div.querySelector(".fu-remove").addEventListener("click", () => div.remove());
   $("#followupList").appendChild(div);
 }
-
 function collectFollowupRules() {
   return [...$$("#followupList .fu-rule")].map(r => {
     const op = r.querySelector(".fu-op").value;
@@ -465,24 +505,27 @@ function collectFollowupRules() {
   }).filter(r => r.field && r.followup_agent_id);
 }
 
-/* ---- Persistence (per-campaign, local) ---- */
-function loadFollowupStore() { return JSON.parse(localStorage.getItem("gupshup_followups") || "{}"); }
+/* ---- Account-scoped persistence (keyed by API token) ---- */
+function fuStoreKey() { return state.token ? "gs_followups::" + state.token : null; }
+function fuRunsKey() { return state.token ? "gs_followup_runs::" + state.token : null; }
+function loadFollowupStore() { const k = fuStoreKey(); return k ? JSON.parse(localStorage.getItem(k) || "{}") : {}; }
 function saveFollowupConfig(campaignId, createdAt, rules) {
   if (!rules.length) return;
+  const k = fuStoreKey(); if (!k) return;
   const store = loadFollowupStore();
   store[campaignId] = {
-    created_at: createdAt,
-    source_number: state.phoneNumber,
-    batch_agent_id: state.agentId,
-    batch_agent_name: agentName(state.agentId),
-    rules,
+    created_at: createdAt, source_number: state.phoneNumber,
+    batch_agent_id: state.agentId, batch_agent_name: agentName(state.agentId), rules,
   };
-  localStorage.setItem("gupshup_followups", JSON.stringify(store));
+  localStorage.setItem(k, JSON.stringify(store));
 }
+function loadRuns() { const k = fuRunsKey(); return k ? JSON.parse(localStorage.getItem(k) || "{}") : {}; }
+function saveRuns(r) { const k = fuRunsKey(); if (k) localStorage.setItem(k, JSON.stringify(r)); }
+function isArmed() { return localStorage.getItem("gupshup_followup_armed") === "1"; }
+function setArmed(v) { localStorage.setItem("gupshup_followup_armed", v ? "1" : "0"); }
+function delayMs(rule) { const n = rule.delay || 0; return rule.unit === "hours" ? n * 3600000 : n * 60000; }
 
-/* ---- Engine helpers (ready; call-monitoring hook wired later) ----
-   matchesCondition: evaluate a rule against a call's details_collection.
-   fireFollowup: place the follow-up via POST /call.                      */
+/* ---- Condition match + the follow-up call (POST /call) ---- */
 function matchesCondition(detailsCollection, rule) {
   const dc = detailsCollection || {};
   const values = dc.collected_values || {};
@@ -511,6 +554,136 @@ async function fireFollowup({ followup_agent_id, source_number, phone_number, me
     method: "POST",
     body: { agent_id: followup_agent_id, source_number, phone_number, metadata: metadata || {} },
   });
+}
+
+/* ============================================================
+   Follow-up ENGINE — uses Call History as source. A call links to
+   a batch config when call.agent_id === batch agent and the call
+   happened after the batch was created (no phone matching).
+   ============================================================ */
+let fuScanning = false;
+async function scanFollowups() {
+  if (fuScanning || !state.token) { renderFollowups(); return; }
+  const configs = loadFollowupStore();
+  const ids = Object.keys(configs);
+  if (!ids.length) { renderFollowups(); return; }
+  fuScanning = true;
+  setFuStatus(`${icon("clock")} Scanning call history…`);
+  try {
+    const earliest = ids.map(id => configs[id].created_at).filter(Boolean).sort()[0];
+    let path = "/calls?page=1&page_size=100&direction=outbound";
+    if (earliest) path += "&from_date=" + encodeURIComponent(earliest);
+    const res = await api(path);
+    const calls = res.data || [];
+    const runs = loadRuns();
+    for (const call of calls) {
+      if (call.status !== "completed" || !call.details_collection) continue;
+      for (const cid of ids) {
+        const cfg = configs[cid];
+        if (call.agent_id !== cfg.batch_agent_id) continue;
+        if (cfg.created_at && new Date(call.started_at) < new Date(cfg.created_at)) continue;
+        (cfg.rules || []).forEach((rule, idx) => {
+          const key = `${call.id}::${cid}::${idx}`;
+          if (runs[key]) return;
+          if (!matchesCondition(call.details_collection, rule)) return;
+          const base = new Date(call.ended_at || call.started_at).getTime();
+          runs[key] = {
+            key, campaignId: cid, ruleIdx: idx, callId: call.id,
+            phone: call.phone_number, source_number: cfg.source_number,
+            followup_agent_id: rule.followup_agent_id, followup_agent_name: rule.followup_agent_name,
+            reason: `${rule.field} ${opLabel(rule.operator)}${rule.value ? " " + rule.value : ""}`,
+            summary: call.call_summary || "", collected: (call.details_collection.collected_values || {}),
+            fireAt: base + delayMs(rule), status: "scheduled",
+          };
+        });
+      }
+    }
+    saveRuns(runs);
+    await processDue();
+    setFuStatus(`Last scan: ${new Date().toLocaleTimeString()} · ${calls.length} calls checked`);
+  } catch (e) {
+    setFuStatus("Scan error: " + e.message, "warn");
+  } finally { fuScanning = false; renderFollowups(); }
+}
+async function processDue() {
+  const runs = loadRuns();
+  const now = Date.now(), armed = isArmed();
+  for (const key of Object.keys(runs)) {
+    const r = runs[key];
+    if (r.status !== "scheduled" && r.status !== "due") continue;
+    if (r.fireAt > now) continue;
+    if (!armed) { r.status = "due"; continue; }
+    await sendFollowup(r, runs);
+  }
+  saveRuns(runs);
+}
+async function sendFollowup(r, runs) {
+  try {
+    await fireFollowup({
+      followup_agent_id: r.followup_agent_id, source_number: r.source_number, phone_number: r.phone,
+      metadata: { ...r.collected, followup_reason: r.reason, previous_call_id: r.callId, previous_call_summary: r.summary },
+    });
+    r.status = "sent"; r.sentAt = Date.now();
+  } catch (e) { r.status = "failed"; r.error = e.message; }
+  if (runs) { runs[r.key] = r; saveRuns(runs); }
+}
+function setFuStatus(html, cls = "") { const el = $("#fuStatus"); if (el) { el.innerHTML = html; el.className = "fu-status " + cls; } }
+
+function renderFollowups() {
+  const configs = loadFollowupStore();
+  const ids = Object.keys(configs);
+  const cc = $("#fuConfigs");
+  if (!cc) return;
+  if (!ids.length) {
+    cc.innerHTML = `<div class="empty">No follow-up rules configured yet. Add them while creating a campaign.</div>`;
+    $("#fuRuns").innerHTML = ""; return;
+  }
+  cc.innerHTML = `<div class="fu-configs-card">
+    <h3>${icon("list-checks")} Active rules (${ids.length} campaign${ids.length > 1 ? "s" : ""})</h3>
+    ${ids.map(id => (configs[id].rules || []).map(r =>
+      `<div class="fu-summary"><span class="fu-ic">${icon("corner-up-right")}</span>
+       <div>Agent <b>${escapeHtml(configs[id].batch_agent_name || "—")}</b>: when <b>${escapeHtml(r.field)}</b> ${escapeHtml(opLabel(r.operator))}${r.value ? ` <b>${escapeHtml(r.value)}</b>` : ""} → call within <b>${r.delay} ${escapeHtml(r.unit)}</b> with <b>${escapeHtml(r.followup_agent_name || "agent")}</b></div></div>`
+    ).join("")).join("")}
+  </div>`;
+
+  const runs = Object.values(loadRuns()).sort((a, b) => (b.fireAt || 0) - (a.fireAt || 0));
+  const wrap = $("#fuRuns");
+  if (!runs.length) { wrap.innerHTML = `<div class="empty">No matching calls found yet. Run a batch, then “Scan now”.</div>`; return; }
+  wrap.innerHTML = "";
+  const now = Date.now();
+  runs.forEach(r => {
+    const el = document.createElement("div");
+    el.className = "fu-run";
+    let when = "";
+    if (r.status === "scheduled") when = r.fireAt > now ? "in " + fmtCountdown(r.fireAt - now) : "due now";
+    else if (r.status === "due") when = "ready to send";
+    else if (r.status === "sent") when = "sent " + (r.sentAt ? new Date(r.sentAt).toLocaleTimeString() : "");
+    else if (r.status === "failed") when = escapeHtml(r.error || "failed");
+    el.innerHTML = `
+      <div class="main">
+        <div class="who">${icon("phone")} ${escapeHtml(r.phone || "—")} <span style="color:var(--muted);font-weight:400">→ ${escapeHtml(r.followup_agent_name || "agent")}</span></div>
+        <div class="reason">When <b>${escapeHtml(r.reason)}</b></div>
+        ${r.summary ? `<div class="snippet">${escapeHtml(r.summary)}</div>` : ""}
+      </div>
+      <div class="when">${when}</div>
+      <span class="fu-pill ${r.status}">${r.status}</span>
+      <div class="actions"></div>`;
+    const actions = el.querySelector(".actions");
+    if (r.status === "scheduled" || r.status === "due") {
+      actions.appendChild(btn("Send now", "btn-outline", async () => {
+        const runs2 = loadRuns(); await sendFollowup(runs2[r.key] || r, runs2); renderFollowups();
+      }, "phone"));
+      actions.appendChild(btn("Skip", "", () => {
+        const runs2 = loadRuns(); if (runs2[r.key]) { runs2[r.key].status = "skipped"; saveRuns(runs2); } renderFollowups();
+      }, "x"));
+    }
+    wrap.appendChild(el);
+  });
+}
+function fmtCountdown(ms) {
+  const m = Math.round(ms / 60000);
+  if (m < 60) return m + "m";
+  const h = Math.floor(m / 60); return `${h}h ${m % 60}m`;
 }
 
 /* ============================================================
@@ -599,8 +772,8 @@ $("#cancelBtn").addEventListener("click", () => { if (confirm("Clear the form?")
 
 function rememberNumber(n) {
   if (!n) return;
-  state.recentNumbers = [n, ...state.recentNumbers.filter(x => x !== n)].slice(0, 10);
-  localStorage.setItem("levrage_numbers", JSON.stringify(state.recentNumbers));
+  const list = [n, ...loadNumbers().filter(x => x !== n)].slice(0, 10);
+  saveNumbers(list);
   refreshNumberOptions();
 }
 function resetForm() {
@@ -772,13 +945,11 @@ function renderBatch(c) {
 }
 function kvline(k, v) { return `<div class="kvline"><span class="k">${k}</span><span class="v">${v}</span></div>`; }
 
-function opLabel(v) { return (FU_OPERATORS.find(o => o.v === v) || {}).label || v; }
 function followupSectionHtml(campaignId) {
   const cfg = loadFollowupStore()[campaignId];
   if (!cfg || !cfg.rules || !cfg.rules.length) return "";
   const rows = cfg.rules.map(r => `
-    <div class="fu-summary">
-      <span class="fu-ic">${icon("corner-up-right")}</span>
+    <div class="fu-summary"><span class="fu-ic">${icon("corner-up-right")}</span>
       <div>When <b>${escapeHtml(r.field)}</b> ${escapeHtml(opLabel(r.operator))}${r.value ? ` <b>${escapeHtml(r.value)}</b>` : ""},
       call within <b>${r.delay} ${escapeHtml(r.unit)}</b> with <b>${escapeHtml(r.followup_agent_name || "agent")}</b>.</div>
     </div>`).join("");
@@ -786,7 +957,7 @@ function followupSectionHtml(campaignId) {
     <div class="batch-section" style="margin-top:20px">
       <h3>${icon("corner-up-right")} Follow-up Rules</h3>
       ${rows}
-      <p class="hint" style="margin-top:10px">${icon("clock")} Follow-ups are evaluated after each call completes. Live triggering activates once call-to-batch linking is configured.</p>
+      <p class="hint" style="margin-top:10px">${icon("clock")} Evaluated from Call History after each call completes — see the Follow-ups tab.</p>
     </div>`;
 }
 
@@ -1015,8 +1186,20 @@ $("#modalClose").addEventListener("click", closeModal);
 $("#modal").addEventListener("click", (e) => { if (e.target.id === "modal") closeModal(); });
 
 /* ============================================================
+   Follow-up controls + background poller
+   ============================================================ */
+$("#fuScan").addEventListener("click", scanFollowups);
+$("#fuArm").addEventListener("change", (e) => {
+  setArmed(e.target.checked);
+  if (e.target.checked) { toast("Auto-send armed — due follow-ups will place real calls", "ok"); processDue().then(renderFollowups); }
+});
+// Poll every 45s while the app is open (client-side engine, for demo).
+setInterval(() => { if (state.token && Object.keys(loadFollowupStore()).length) scanFollowups(); }, 45000);
+
+/* ============================================================
    Init
    ============================================================ */
 hydrateIcons();
 refreshTokenUI();
+$("#fuArm").checked = isArmed();
 if (state.token) loadAgents();
