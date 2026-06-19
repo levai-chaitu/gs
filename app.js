@@ -516,7 +516,7 @@ function normalizeFollowupStore() {
 }
 function loadRuns() { const k = fuRunsKey(); return k ? JSON.parse(localStorage.getItem(k) || "{}") : {}; }
 function saveRuns(r) { const k = fuRunsKey(); if (k) localStorage.setItem(k, JSON.stringify(r)); }
-function isArmed() { return localStorage.getItem("gupshup_followup_armed") === "1"; }
+function isArmed() { return localStorage.getItem("gupshup_followup_armed") !== "0"; } // on by default
 function setArmed(v) { localStorage.setItem("gupshup_followup_armed", v ? "1" : "0"); }
 function delayMs(rule) {
   const n = rule.delay || 0;
