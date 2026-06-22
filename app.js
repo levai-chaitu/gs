@@ -593,7 +593,7 @@ async function scanFollowups() {
       const base = new Date(call.ended_at || call.started_at).getTime();
       runs[key] = {
         key, campaignId: cid, callId: call.id,
-        phone: call.phone_number, source_number: configs[cid].source_number || SOURCE_NUMBER,
+        phone: call.phone_number, source_number: SOURCE_NUMBER,
         followup_agent_id: rule.followup_agent_id, followup_agent_name: rule.followup_agent_name,
         reason: `${rule.field} ${opLabel(rule.operator)}${rule.value ? " " + rule.value : ""}`,
         summary: call.call_summary || "", collected: (call.details_collection.collected_values || {}),
@@ -608,26 +608,47 @@ async function scanFollowups() {
   } finally { fuScanning = false; renderFollowups(); }
 }
 async function processDue() {
-  const runs = loadRuns();
   const now = Date.now(), armed = isArmed();
-  for (const key of Object.keys(runs)) {
-    const r = runs[key];
-    if (r.status !== "scheduled" && r.status !== "due") continue;
-    if (r.fireAt > now) continue;
-    if (!armed) { r.status = "due"; continue; }
-    await sendFollowup(r, runs);
+  // Snapshot the keys to process; sendFollowup re-reads/re-persists the store per run,
+  // so we don't keep a stale `runs` object around to save back (which would clobber it).
+  const keys = Object.keys(loadRuns());
+  if (!armed) {
+    const runs = loadRuns();
+    for (const key of keys) {
+      const r = runs[key];
+      if (!r || (r.status !== "scheduled" && r.status !== "due")) continue;
+      if (r.fireAt <= now) r.status = "due";
+    }
+    saveRuns(runs);
+    return;
   }
-  saveRuns(runs);
+  for (const key of keys) {
+    const r = loadRuns()[key];   // re-read each iteration so claims/sends are seen
+    if (!r || (r.status !== "scheduled" && r.status !== "due")) continue;
+    if (r.fireAt > now) continue;
+    await sendFollowup(r);
+  }
 }
 async function sendFollowup(r, runs) {
+  // Claim the run BEFORE the network call: persist "sending" synchronously so any
+  // overlapping scan/poller (or a "Send now" click) re-reads the store, sees it's
+  // already in-flight, and skips it — preventing duplicate calls for one run.
+  const store = loadRuns();
+  const cur = store[r.key];
+  if (cur && cur.status !== "scheduled" && cur.status !== "due") return; // already claimed/sent
+  if (cur) { cur.status = "sending"; saveRuns(store); }
+  r.status = "sending";
+  if (runs) runs[r.key] = r;
   try {
     await fireFollowup({
-      followup_agent_id: r.followup_agent_id, source_number: r.source_number || SOURCE_NUMBER, phone_number: r.phone,
+      followup_agent_id: r.followup_agent_id, source_number: SOURCE_NUMBER, phone_number: r.phone,
       metadata: { ...r.collected, followup_reason: r.reason, previous_call_id: r.callId, previous_call_summary: r.summary },
     });
     r.status = "sent"; r.sentAt = Date.now();
   } catch (e) { r.status = "failed"; r.error = e.message; }
-  if (runs) { runs[r.key] = r; saveRuns(runs); }
+  // Persist the final status against the latest store (re-read, since we awaited).
+  const after = loadRuns(); after[r.key] = r; saveRuns(after);
+  if (runs) runs[r.key] = r;
 }
 function setFuStatus(html, cls = "") { const el = $("#fuStatus"); if (el) { el.innerHTML = html; el.className = "fu-status " + cls; } }
 
