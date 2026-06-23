@@ -355,9 +355,12 @@ tr:last-child td { border-bottom: none; }
 .kvline { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-top: 1px solid var(--border); font-size: 13.5px; }
 .kvline:first-of-type { border-top: none; }
 .kvline .k { color: var(--muted); }
-.tagchip { font-size: 11px; padding: 3px 10px; border-radius: 6px; font-weight: 600; }
-.tagchip.on { background: #e3f4ea; color: var(--green); }
+.tagchip { font-size: 11px; padding: 3px 10px; border-radius: 6px; font-weight: 600; text-transform: capitalize; }
+.tagchip.on, .tagchip.good { background: #e3f4ea; color: var(--green); }
 .tagchip.off { background: var(--surface-3); color: var(--muted); }
+.tagchip.bad { background: #fde2e2; color: var(--red); }
+.tagchip.warn { background: #fbeed6; color: var(--amber); }
+hr.sep { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
 
 /* ===== Outcome breakdown bar (campaign modal) ===== */
 .outcome-bar { display: flex; height: 12px; border-radius: 8px; overflow: hidden; background: var(--surface-2); margin: 8px 0 14px; }

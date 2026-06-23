@@ -6,23 +6,54 @@
      POST /campaigns/{id}/pause     /resume     /stop     /cancel
    ============================================================ */
 
-const API_BASE = "https://api.levrage.ai/v1";
+const API_BASE = "https://api.levrage.ai/v1";   // Levrage — used ONLY for call history (/calls) + agent list (/agents)
 const MAX_CONCURRENT = 20; // account slots (no API for this; reference showed ~11)
 const API_TOKEN = "lev_iFeIGO5CboduSWjYOp9ujzZIu_IfF-Z3X_GEg2R6KLI"; // gs pre-sales key
 const SOURCE_NUMBER = "+13057034997"; // default source/caller number (batch + follow-up)
 const SOURCE_NUMBERS = ["+13057034997", "00919240012505"]; // selectable source/caller numbers
 
-// Hardcoded follow-up rule applied to every campaign (UI for it is hidden):
-// when interested_to_take_loan == yes, after 30s call the Karnataka follow-up agent.
+// Knowlarity is reached through our own serverless proxy (browser can't call it
+// directly — otpcall's CORS preflight returns 403). See api/call.js.
+const KNOWLARITY_PROXY = "/api/call";
+const GAP_BETWEEN_CALLS_MS = 4000; // pause between manual batch dials (Knowlarity rate-limits / 429s rapid calls)
+const FOLLOWUP_LOOKBACK_MS = 5 * 60 * 1000; // follow-up scan only considers calls from the last 5 minutes
+
+// Hardcoded follow-up rule: as soon as PCA marks interested_to_take_loan == yes,
+// place the follow-up call (delay 0 — purely PCA-driven, no artificial wait).
+// The follow-up target (SR number + IVR id) is NOT here — it comes from the
+// per-batch "Follow-up call settings" entered at batch creation.
 const HARDCODED_FOLLOWUP_RULES = [{
   field: "interested_to_take_loan",
   operator: "equals",
   value: "yes",
-  delay: 30,
+  delay: 0,
   unit: "seconds",
-  followup_agent_id: "413aed2c-0c2d-4a3a-bf84-dd384b80f9be",
-  followup_agent_name: "Karnataka Bank Limited - follow up agent",
 }];
+
+// Place a Knowlarity call via the proxy. endpoint: "otpcall" (default) | "makecall".
+async function knowlarityCall(params) {
+  const res = await fetch(KNOWLARITY_PROXY, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params),
+  });
+  let data; try { data = await res.json(); } catch { data = null; }
+  if (!res.ok || (data && data.error)) {
+    throw new Error((data && (data.error || (data.error && data.error.message))) || `Knowlarity HTTP ${res.status}`);
+  }
+  return data;
+}
+// Normalize a phone number for matching (strip spaces, dashes, parens; keep leading +).
+function normPhone(s) {
+  if (!s) return "";
+  let v = String(s).trim().replace(/[\s\-()]/g, "");
+  if (v && !v.startsWith("+") && /^\d{10,}$/.test(v)) {
+    if (v.length === 10) v = "+91" + v;          // bare 10-digit Indian number
+    else if (/^91\d{10}$/.test(v)) v = "+" + v;  // 91XXXXXXXXXX
+    else v = "+" + v;
+  }
+  return v;
+}
 
 const state = {
   token: API_TOKEN,
@@ -487,33 +518,22 @@ function collectFollowupRules() {
 function fuStoreKey() { return state.token ? "gs_followups::" + state.token : null; }
 function fuRunsKey() { return state.token ? "gs_followup_runs::" + state.token : null; }
 function loadFollowupStore() { const k = fuStoreKey(); return k ? JSON.parse(localStorage.getItem(k) || "{}") : {}; }
-function saveFollowupConfig(campaignId, createdAt, rules) {
-  if (!rules.length) return;
+// One follow-up config per batch. Keyed by the local batch id. Stores the
+// condition rule, the follow-up routing (SR/IVR), and the dialed phone list so
+// the scan only follows up numbers WE dialed in this batch (never organic calls).
+function saveFollowupConfig(batch) {
   const k = fuStoreKey(); if (!k) return;
   const store = loadFollowupStore();
-  store[campaignId] = {
-    created_at: createdAt, source_number: state.phoneNumber,
-    batch_agent_id: state.agentId, batch_agent_name: agentName(state.agentId), rules,
+  store[batch.id] = {
+    created_at: batch.created_at,
+    batch_agent_id: batch.agent_id,
+    batch_agent_name: batch.agent_name,
+    followup_sr: batch.followup_sr,
+    followup_ivr: batch.followup_ivr,
+    phones: batch.phones,                 // numbers dialed in this batch
+    rules: HARDCODED_FOLLOWUP_RULES,
   };
   localStorage.setItem(k, JSON.stringify(store));
-}
-// Collapse stored configs so there is at most ONE per batch agent (keep the
-// most recent) and force its rule to the current hardcoded rule. This removes
-// stale duplicates like an old "1 minutes" rule alongside the "30 seconds" one.
-function normalizeFollowupStore() {
-  const k = fuStoreKey(); if (!k) return;
-  const store = loadFollowupStore();
-  const byAgent = {};
-  for (const id of Object.keys(store)) {
-    const cfg = store[id], a = cfg.batch_agent_id || "";
-    if (!byAgent[a] || (cfg.created_at || "") > (byAgent[a].cfg.created_at || "")) byAgent[a] = { id, cfg };
-  }
-  const next = {};
-  for (const a of Object.keys(byAgent)) {
-    const { id, cfg } = byAgent[a];
-    next[id] = { ...cfg, rules: HARDCODED_FOLLOWUP_RULES };
-  }
-  localStorage.setItem(k, JSON.stringify(next));
 }
 function loadRuns() { const k = fuRunsKey(); return k ? JSON.parse(localStorage.getItem(k) || "{}") : {}; }
 function saveRuns(r) { const k = fuRunsKey(); if (k) localStorage.setItem(k, JSON.stringify(r)); }
@@ -550,10 +570,16 @@ function matchesCondition(detailsCollection, rule) {
     default: return false;
   }
 }
-async function fireFollowup({ followup_agent_id, source_number, phone_number, metadata }) {
-  return api("/call", {
-    method: "POST",
-    body: { agent_id: followup_agent_id, source_number, phone_number, metadata: metadata || {} },
+// Follow-up call is a Knowlarity otpcall (via proxy) to the batch's follow-up
+// SR number + IVR — NOT a Levrage agent call.
+async function fireFollowup({ followup_sr, followup_ivr, phone_number }) {
+  return knowlarityCall({
+    endpoint: "otpcall",
+    ivr_id: followup_ivr,
+    k_number: followup_sr,
+    customer_number: phone_number,
+    caller_id: followup_sr,
+    is_promotional: false,
   });
 }
 
@@ -571,9 +597,10 @@ async function scanFollowups() {
   fuScanning = true;
   setFuStatus(`${icon("clock")} Scanning call history…`);
   try {
-    const earliest = ids.map(id => configs[id].created_at).filter(Boolean).sort()[0];
-    let path = "/calls?page=1&page_size=100&direction=outbound";
-    if (earliest) path += "&from_date=" + encodeURIComponent(earliest);
+    // Only pull calls from the last 5 minutes — never sweep the whole history
+    // (so we don't "catch up" and fire follow-ups for old calls).
+    const since = new Date(Date.now() - FOLLOWUP_LOOKBACK_MS).toISOString();
+    const path = "/calls?page=1&page_size=100&direction=outbound&from_date=" + encodeURIComponent(since);
     const res = await api(path);
     const calls = res.data || [];
     const runs = loadRuns();
@@ -583,18 +610,29 @@ async function scanFollowups() {
     for (const call of calls) {
       if (call.status !== "completed" || !call.details_collection) continue;
       if (handledCallIds.has(call.id)) continue;   // dedup per call, even across old keys
-      // Find the campaign this call belongs to (batch agent + time) — only to get its source number.
-      const cid = ids.find(id => configs[id].batch_agent_id === call.agent_id &&
-        (!configs[id].created_at || new Date(call.started_at) >= new Date(configs[id].created_at)));
+      // Hard recency guard in case the API returns anything older than the window.
+      const startedMs = new Date(call.started_at || call.ended_at).getTime();
+      if (isNaN(startedMs) || Date.now() - startedMs > FOLLOWUP_LOOKBACK_MS) continue;
+      const phone = normPhone(call.phone_number);
+      // Link the call to a batch: same Karn agent + the number was in THIS batch's
+      // dialed list + the call happened after the batch was created. The phone-list
+      // match ensures we never follow up organic (non-batch) calls by the same agent.
+      const cid = ids.find(id => {
+        const cfg = configs[id];
+        if (cfg.batch_agent_id && cfg.batch_agent_id !== call.agent_id) return false;
+        if (cfg.created_at && new Date(call.started_at) < new Date(cfg.created_at)) return false;
+        return Array.isArray(cfg.phones) && cfg.phones.includes(phone);
+      });
       if (!cid) continue;
-      const key = `${call.id}::${rule.followup_agent_id}`;
+      const cfg = configs[cid];
+      const key = `${call.id}::fu`;
       if (runs[key]) continue;
       if (!matchesCondition(call.details_collection, rule)) continue;
       const base = new Date(call.ended_at || call.started_at).getTime();
       runs[key] = {
         key, campaignId: cid, callId: call.id,
-        phone: call.phone_number, source_number: SOURCE_NUMBER,
-        followup_agent_id: rule.followup_agent_id, followup_agent_name: rule.followup_agent_name,
+        phone: call.phone_number,
+        followup_sr: cfg.followup_sr, followup_ivr: cfg.followup_ivr,
         reason: `${rule.field} ${opLabel(rule.operator)}${rule.value ? " " + rule.value : ""}`,
         summary: call.call_summary || "", collected: (call.details_collection.collected_values || {}),
         fireAt: base + delayMs(rule), status: "scheduled",
@@ -640,10 +678,7 @@ async function sendFollowup(r, runs) {
   r.status = "sending";
   if (runs) runs[r.key] = r;
   try {
-    await fireFollowup({
-      followup_agent_id: r.followup_agent_id, source_number: SOURCE_NUMBER, phone_number: r.phone,
-      metadata: { ...r.collected, followup_reason: r.reason, previous_call_id: r.callId, previous_call_summary: r.summary },
-    });
+    await fireFollowup({ followup_sr: r.followup_sr, followup_ivr: r.followup_ivr, phone_number: r.phone });
     r.status = "sent"; r.sentAt = Date.now();
   } catch (e) { r.status = "failed"; r.error = e.message; }
   // Persist the final status against the latest store (re-read, since we awaited).
@@ -665,7 +700,7 @@ function renderFollowups() {
     <h3>${icon("list-checks")} Active rule</h3>
     ${HARDCODED_FOLLOWUP_RULES.map(r =>
       `<div class="fu-summary"><span class="fu-ic">${icon("corner-up-right")}</span>
-       <div>When <b>${escapeHtml(r.field)}</b> ${escapeHtml(opLabel(r.operator))}${r.value ? ` <b>${escapeHtml(r.value)}</b>` : ""} → call within <b>${r.delay} ${escapeHtml(r.unit)}</b> with <b>${escapeHtml(r.followup_agent_name || "agent")}</b></div></div>`
+       <div>When <b>${escapeHtml(r.field)}</b> ${escapeHtml(opLabel(r.operator))}${r.value ? ` <b>${escapeHtml(r.value)}</b>` : ""} → call within <b>${r.delay} ${escapeHtml(r.unit)}</b> via the batch's follow-up IVR (Knowlarity otpcall)</div></div>`
     ).join("")}
   </div>`;
 
@@ -684,7 +719,7 @@ function renderFollowups() {
     else if (r.status === "failed") when = escapeHtml(r.error || "failed");
     el.innerHTML = `
       <div class="main">
-        <div class="who">${icon("phone")} ${escapeHtml(r.phone || "—")} <span style="color:var(--muted);font-weight:400">→ ${escapeHtml(r.followup_agent_name || "agent")}</span></div>
+        <div class="who">${icon("phone")} ${escapeHtml(r.phone || "—")} <span style="color:var(--muted);font-weight:400">→ IVR ${escapeHtml(r.followup_ivr || "—")} on ${escapeHtml(r.followup_sr || "—")}</span></div>
         <div class="reason">When <b>${escapeHtml(r.reason)}</b></div>
         ${r.summary ? `<div class="snippet">${escapeHtml(r.summary)}</div>` : ""}
       </div>
@@ -713,83 +748,64 @@ function fmtCountdown(ms) {
    Validation + payload
    ============================================================ */
 function validate() {
-  const ok = $("#c_name").value.trim() && state.agentId && state.phoneNumber &&
-             state.contacts.length > 0 && $("#c_phone_column").value;
+  const ok = $("#c_name").value.trim() && state.agentId &&
+             state.contacts.length > 0 && $("#c_phone_column").value &&
+             $("#c_batch_sr").value.trim() && $("#c_batch_ivr").value.trim() &&
+             $("#c_fu_sr").value.trim() && $("#c_fu_ivr").value.trim();
   $("#startNowBtn").disabled = !ok;
   $("#scheduleBtn").disabled = !ok;
   return ok;
 }
 $("#c_name").addEventListener("input", validate);
+["#c_batch_sr", "#c_batch_ivr", "#c_fu_sr", "#c_fu_ivr"].forEach(s => $(s).addEventListener("input", validate));
 
-function buildPayload({ scheduled } = {}) {
-  const map = state.colMap || {};
-  // Remap every contact key to its sanitized name so the API accepts them.
-  const contacts = state.contacts.map(row => {
-    const out = {};
-    for (const k in row) out[map[k] || sanitizeKey(k)] = row[k];
-    return out;
-  });
-  const selected = $("#c_phone_column").value;
-  const payload = {
+// Build the local batch object from the form (no Levrage API).
+function buildBatch() {
+  const phoneCol = $("#c_phone_column").value;
+  const phones = [];
+  const seen = new Set();
+  for (const row of state.contacts) {
+    const p = normPhone(row[phoneCol]);
+    if (p && !seen.has(p)) { seen.add(p); phones.push(p); }
+  }
+  return {
+    id: localId(),
     name: $("#c_name").value.trim(),
+    created_at: new Date().toISOString(),
     agent_id: state.agentId,
-    phone_number: state.phoneNumber,
-    phone_column: map[selected] || sanitizeKey(selected),
-    contacts,
-    max_concurrent_calls: parseInt(concSel.value) || 1,
+    agent_name: agentName(state.agentId),
+    phone_column: phoneCol,
+    contacts: state.contacts,
+    phones,
+    dialed: {},
+    dialing: false,
+    batch_sr: normPhone($("#c_batch_sr").value.trim()),
+    batch_ivr: $("#c_batch_ivr").value.trim(),
+    followup_sr: normPhone($("#c_fu_sr").value.trim()),
+    followup_ivr: $("#c_fu_ivr").value.trim(),
   };
-  if (scheduled) {
-    const d = $("#c_sched_date").value, t = $("#c_sched_time").value;
-    payload.schedule_time = new Date(`${d}T${t || "00:00"}`).toISOString();
-  }
-  if ($("#c_daily_start").value) payload.daily_start_time = $("#c_daily_start").value;
-  if ($("#c_daily_end").value) payload.daily_end_time = $("#c_daily_end").value;
-  if ($("#r_enabled").checked) {
-    payload.retry_config = {
-      enabled: true,
-      on_statuses: $("#r_on_statuses").value.split(",").map(s => s.trim()).filter(Boolean),
-      interval_value: parseInt($("#r_interval_value").value) || 30,
-      interval_unit: $("#r_interval_unit").value,
-      max_retries: parseInt($("#r_max_retries").value) || 3,
-      respect_calling_hours: $("#r_respect_hours").checked,
-    };
-  }
-  const bos = [...$$("#blackoutList .blackout-row")].map(r => ({
-    start: r.querySelector(".bo-start").value, end: r.querySelector(".bo-end").value,
-  })).filter(b => b.start && b.end);
-  if (bos.length) payload.blackout_periods = bos;
-  return payload;
 }
 
-async function submitCampaign(scheduled) {
+async function submitCampaign(startNow) {
   if (!validate()) return;
-  if (scheduled && !$("#c_sched_date").value) {
-    setMsg("Pick a schedule date & time to schedule later.", "err"); return;
-  }
   if (state.contacts.length > 2000) {
     setMsg(`Max 2000 contacts (sheet has ${state.contacts.length}).`, "err"); return;
   }
-  const payload = buildPayload({ scheduled });
-  $("#startNowBtn").disabled = true; $("#scheduleBtn").disabled = true;
-  setMsg('<span class="spinner"></span> Creating…');
-  try {
-    const res = await api("/campaigns", { method: "POST", body: payload });
-    const c = res.data;
-    rememberNumber(state.phoneNumber);
-    saveFollowupConfig(c.id, c.created_at, HARDCODED_FOLLOWUP_RULES);   // rule is hardcoded
-    normalizeFollowupStore();   // keep a single config per agent
-    setMsg(`Created "${c.name}" — ${c.valid_contacts ?? c.total_contacts} valid contacts (${c.status}) · follow-up active`, "ok");
-    toast(scheduled ? "Campaign scheduled" : "Campaign launched", "ok");
-    resetForm();
-    $('.side-item[data-view="list"]').click();
-  } catch (e) {
-    setMsg(e.message, "err"); toast("Failed: " + e.message, "err");
-  } finally { validate(); }
+  const b = buildBatch();
+  if (!b.phones.length) { setMsg("No valid phone numbers found in the selected column.", "err"); return; }
+  putBatch(b);
+  // Persist the follow-up config (condition + follow-up routing + the dialed phone list).
+  saveFollowupConfig(b);
+  setMsg(`Created "${b.name}" — ${b.phones.length} numbers · follow-up active`, "ok");
+  toast(startNow ? "Batch created — dialing…" : "Batch created", "ok");
+  resetForm();
+  $('.side-item[data-view="list"]').click();
+  if (startNow) startDialing(b.id);
 }
 function setMsg(html, cls = "") { const m = $("#createMsg"); m.innerHTML = html; m.className = "msg " + cls; }
 
-$("#startNowBtn").addEventListener("click", () => submitCampaign(false));
-$("#scheduleBtn").addEventListener("click", () => submitCampaign(true));
+$("#startNowBtn").addEventListener("click", () => submitCampaign(true));
+$("#scheduleBtn").addEventListener("click", () => submitCampaign(false));
 $("#cancelBtn").addEventListener("click", () => { if (confirm("Clear the form?")) resetForm(); });
 
 function rememberNumber(n) {
@@ -806,52 +822,112 @@ function resetForm() {
   $("#previewWrap").style.display = "none"; $("#previewEmpty").style.display = "flex";
   $("#totalRows").style.display = "none";
   $("#followupList").innerHTML = "";
+  // Keep SR/IVR routing values — they're usually reused across batches.
   setMsg("");
 }
 
 /* ============================================================
-   Campaigns list
+   Local batch store (NO Levrage campaign API). A batch holds the
+   uploaded contacts, the Karn agent (for matching call history),
+   and the Knowlarity routing (batch + follow-up SR/IVR). Initial
+   calls are placed manually one-by-one via the otpcall proxy.
    ============================================================ */
-async function loadCampaigns() {
-  const wrap = $("#campaignsList");
-  wrap.innerHTML = '<div class="empty"><span class="spinner"></span> Loading…</div>';
-  try {
-    let path = "/campaigns?page=1&page_size=50";
-    const s = $("#statusFilter").value; if (s) path += "&status=" + encodeURIComponent(s);
-    const res = await api(path);
-    const items = res.data || [];
-    if (!items.length) { wrap.innerHTML = '<div class="empty">No campaigns yet.</div>'; return; }
-    wrap.innerHTML = ""; items.forEach(c => wrap.appendChild(campaignCard(c)));
-  } catch (e) { wrap.innerHTML = `<div class="empty">Error: ${escapeHtml(e.message)}</div>`; }
+function batchesKey() { return state.token ? "gs_batches::" + state.token : null; }
+function loadBatches() { const k = batchesKey(); return k ? JSON.parse(localStorage.getItem(k) || "{}") : {}; }
+function saveBatches(b) { const k = batchesKey(); if (k) localStorage.setItem(k, JSON.stringify(b)); }
+function getBatch(id) { return loadBatches()[id]; }
+function putBatch(b) { const all = loadBatches(); all[b.id] = b; saveBatches(all); }
+function localId() { return "b_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4); }
+
+// ---- Sequential dialer: places one otpcall per contact, with a gap ----
+const dialers = {};   // batchId -> { stop: bool }
+async function startDialing(id) {
+  const b = getBatch(id); if (!b) return;
+  if (dialers[id] && !dialers[id].stop) return;   // already running
+  dialers[id] = { stop: false };
+  b.dialing = true; putBatch(b);
+  renderBatchesIfVisible(); openBatchIfVisible(id);
+  for (const phone of b.phones) {
+    if (dialers[id].stop) break;
+    const cur = getBatch(id);                       // re-read for latest statuses
+    const st = cur.dialed[phone];
+    if (st && (st.status === "placed" || st.status === "calling")) continue;  // skip already done
+    cur.dialed[phone] = { status: "calling", at: Date.now() };
+    putBatch(cur); openBatchIfVisible(id);
+    try {
+      const r = await knowlarityCall({
+        endpoint: "otpcall",
+        ivr_id: cur.batch_ivr,
+        k_number: cur.batch_sr,
+        customer_number: phone,
+        caller_id: cur.batch_sr,
+        is_promotional: false,
+      });
+      const callId = r && r.call_ids && r.call_ids[0] && r.call_ids[0].call_id;
+      const after = getBatch(id);
+      after.dialed[phone] = { status: "placed", call_id: callId || null, at: Date.now() };
+      putBatch(after);
+    } catch (e) {
+      const after = getBatch(id);
+      after.dialed[phone] = { status: "failed", error: e.message, at: Date.now() };
+      putBatch(after);
+    }
+    openBatchIfVisible(id); renderBatchesIfVisible();
+    if (dialers[id].stop) break;
+    await sleep(GAP_BETWEEN_CALLS_MS);              // respect Knowlarity rate limits
+  }
+  const done = getBatch(id); if (done) { done.dialing = false; putBatch(done); }
+  dialers[id] = { stop: true };
+  renderBatchesIfVisible(); openBatchIfVisible(id);
 }
+function stopDialing(id) { if (dialers[id]) dialers[id].stop = true; const b = getBatch(id); if (b) { b.dialing = false; putBatch(b); } renderBatchesIfVisible(); openBatchIfVisible(id); }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function batchProgress(b) {
+  const vals = Object.values(b.dialed || {});
+  return {
+    total: b.phones.length,
+    placed: vals.filter(v => v.status === "placed").length,
+    failed: vals.filter(v => v.status === "failed").length,
+    calling: vals.filter(v => v.status === "calling").length,
+  };
+}
+
+/* ============================================================
+   Batches list (local)
+   ============================================================ */
+function loadCampaigns() {
+  const wrap = $("#campaignsList");
+  const all = Object.values(loadBatches()).sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+  if (!all.length) { wrap.innerHTML = '<div class="empty">No batches yet. Create one from “Outbound Campaign”.</div>'; return; }
+  wrap.innerHTML = ""; all.forEach(c => wrap.appendChild(campaignCard(c)));
+}
+function renderBatchesIfVisible() { if ($("#view-list").classList.contains("active")) loadCampaigns(); }
 $("#reloadCampaigns").addEventListener("click", loadCampaigns);
 $("#statusFilter").addEventListener("change", loadCampaigns);
 
 function campaignCard(c) {
   const el = document.createElement("div");
   el.className = "campaign-card";
-  const pickup = c.pickup_rate != null ? c.pickup_rate.toFixed(1) + "%" : "—";
+  const p = batchProgress(c);
+  const status = c.dialing ? "in_progress" : (p.placed + p.failed >= p.total && p.total ? "completed" : "pending");
   el.innerHTML = `
     <div class="campaign-main">
       <div class="campaign-name">${escapeHtml(c.name)}</div>
-      <div class="campaign-meta">${shortId(c.id)} · ${fmtDate(c.created_at)}</div>
+      <div class="campaign-meta">${escapeHtml(c.agent_name || "—")} · ${fmtDate(c.created_at)}</div>
     </div>
     <div class="campaign-stats">
-      <div class="stat"><b>${c.total ?? 0}</b><span>total</span></div>
-      <div class="stat"><b>${c.completed ?? 0}</b><span>done</span></div>
-      <div class="stat"><b>${c.failed ?? 0}</b><span>failed</span></div>
-      <div class="stat"><b>${c.no_answer ?? 0}</b><span>no ans</span></div>
-      <div class="stat"><b>${pickup}</b><span>pickup</span></div>
+      <div class="stat"><b>${p.total}</b><span>total</span></div>
+      <div class="stat"><b>${p.placed}</b><span>placed</span></div>
+      <div class="stat"><b>${p.calling}</b><span>calling</span></div>
+      <div class="stat"><b>${p.failed}</b><span>failed</span></div>
     </div>
-    <span class="pill ${c.status}">${(c.status || "").replace("_", " ")}</span>
+    <span class="pill ${status}">${status.replace("_", " ")}</span>
     <div class="campaign-actions"></div>`;
   const actions = el.querySelector(".campaign-actions");
-  if (c.status === "in_progress" || c.status === "pending")
-    actions.appendChild(btn("Pause", "", (e) => { e.stopPropagation(); act(c.id, "pause"); }, "pause"));
-  else if (c.status === "paused")
-    actions.appendChild(btn("Resume", "", (e) => { e.stopPropagation(); act(c.id, "resume"); }, "play"));
-  if (["in_progress", "pending", "paused"].includes(c.status))
-    actions.appendChild(btn("Stop", "btn-danger", (e) => { e.stopPropagation(); if (confirm("Stop this campaign?")) act(c.id, "stop"); }, "stop"));
+  if (c.dialing)
+    actions.appendChild(btn("Pause", "", (e) => { e.stopPropagation(); stopDialing(c.id); }, "pause"));
+  else if (p.placed + p.failed < p.total)
+    actions.appendChild(btn(p.placed + p.failed > 0 ? "Resume" : "Start calling", "", (e) => { e.stopPropagation(); startDialing(c.id); }, "play"));
   el.addEventListener("click", () => openBatch(c.id));
   return el;
 }
@@ -861,24 +937,23 @@ function btn(label, cls, onClick, iconName) {
   b.innerHTML = (iconName ? icon(iconName) + " " : "") + escapeHtml(label);
   b.addEventListener("click", onClick); return b;
 }
-async function act(id, action, after) {
-  try { const r = await api(`/campaigns/${id}/${action}`, { method: "POST" });
-    toast(r.message || (action + " ok"), "ok"); (after || loadCampaigns)(); }
-  catch (e) { toast(`${action} failed: ${e.message}`, "err"); }
-}
 
 /* ============================================================
-   Batch Details — full page (only data GET /campaigns/{id} returns)
+   Batch Details — local batch (per-contact dial status + controls)
    ============================================================ */
-async function openBatch(id) {
+let openBatchId = null;
+function openBatch(id) {
+  openBatchId = id;
   showView("batch", { sidebar: "list" });
-  $("#batchCredits").textContent = "—";
-  $("#batchBody").innerHTML = '<div class="empty"><span class="spinner"></span> Loading…</div>';
-  try {
-    const res = await api(`/campaigns/${id}`);
-    const c = res.data;
-    renderBatch(c);
-  } catch (e) { $("#batchBody").innerHTML = `<div class="empty">Error: ${escapeHtml(e.message)}</div>`; }
+  const c = getBatch(id);
+  if (!c) { $("#batchBody").innerHTML = `<div class="empty">Batch not found.</div>`; return; }
+  renderBatch(c);
+}
+// Re-render the open batch in place (used by the dialer as statuses change).
+function openBatchIfVisible(id) {
+  if (openBatchId === id && $("#view-batch").classList.contains("active")) {
+    const c = getBatch(id); if (c) renderBatch(c);
+  }
 }
 
 function statCard(label, iconName, value, foot, tone = "") {
@@ -890,96 +965,76 @@ function statCard(label, iconName, value, foot, tone = "") {
 }
 
 function renderBatch(c) {
-  const done = c.completed || 0, fail = c.failed || 0, na = c.no_answer || 0, vm = c.voicemail || 0;
-  const placed = done + fail + na + vm;
-  const total = c.total_contacts || 0;
-  const placePct = total ? Math.round(placed / total * 100) : 0;
-  const pctOf = (n) => placed ? Math.round(n / placed * 100) + "% of placed" : "—";
-  const pill = `<span class="pill ${c.status}">${(c.status || "").replace("_", " ")}</span>`;
+  const p = batchProgress(c);
+  const pending = p.total - p.placed - p.failed - p.calling;
+  const status = c.dialing ? "in_progress" : (p.placed + p.failed >= p.total && p.total ? "completed" : "pending");
+  const pill = `<span class="pill ${status}">${status.replace("_", " ")}</span>`;
+  const statusLabel = (ph) => (c.dialed[ph] && c.dialed[ph].status) || "pending";
+
+  const rows = c.phones.map(ph => {
+    const d = c.dialed[ph] || {};
+    const cls = { placed: "good", failed: "bad", calling: "warn" }[d.status] || "";
+    const extra = d.status === "placed" ? (d.call_id ? shortId(d.call_id) : "ok")
+                : d.status === "failed" ? escapeHtml(d.error || "error") : "";
+    return `<tr><td>${escapeHtml(ph)}</td>
+      <td><span class="tagchip ${cls}">${statusLabel(ph)}</span></td>
+      <td class="muted">${extra}</td></tr>`;
+  }).join("");
 
   $("#batchBody").innerHTML = `
     <div class="batch-head-card">
-      <div class="batch-title-row">
-        <h2>${escapeHtml(c.name)}</h2>
-        ${pill}
-      </div>
-      <span class="batch-id">${escapeHtml(c.id)}<button class="copy" data-copy="${escapeHtml(c.id)}">${icon("copy")}</button></span>
+      <div class="batch-title-row"><h2>${escapeHtml(c.name)}</h2>${pill}</div>
       <div class="batch-meta-row">
         <div><div class="k">Created</div><div class="v">${icon("calendar")} ${fmtDate(c.created_at)}</div></div>
-        <div><div class="k">Total Calls</div><div class="v">${icon("phone")} ${total}</div></div>
-        <div><div class="k">Updated</div><div class="v">${icon("clock")} ${fmtDate(c.updated_at)}</div></div>
-        <div><div class="k">Description</div><div class="v">${escapeHtml(c.description || "—")}</div></div>
+        <div><div class="k">Agent</div><div class="v">${icon("user")} ${escapeHtml(c.agent_name || "—")}</div></div>
+        <div><div class="k">Batch SR / IVR</div><div class="v">${escapeHtml(c.batch_sr)} · ${escapeHtml(c.batch_ivr)}</div></div>
+        <div><div class="k">Follow-up SR / IVR</div><div class="v">${escapeHtml(c.followup_sr)} · ${escapeHtml(c.followup_ivr)}</div></div>
       </div>
     </div>
 
     <div class="stat-grid">
-      ${statCard("Calls placed / total", "phone-call", `${placed} <span class="of">/ ${total}</span>`, `${placePct}% placement rate`, "accent")}
-      ${statCard("Completed", "check-circle", done, pctOf(done), "good")}
-      ${statCard("Voicemail", "voicemail", vm, vm ? pctOf(vm) : "No voicemails", "warn")}
-      ${statCard("No answer", "phone-off", na, na ? pctOf(na) : "No missed", "")}
-      ${statCard("Failed", "x-circle", fail, fail ? pctOf(fail) : "No failures", "bad")}
-      ${statCard("Skipped", "alert-triangle", c.skipped_contacts || 0, "Invalid / skipped contacts", "")}
-      ${statCard("Valid contacts", "list-checks", c.valid_contacts || 0, "Passed validation", "")}
-      ${statCard("Pending retries", "refresh", c.pending_retries || 0, "Queued for retry", "")}
-    </div>
-
-    <div class="batch-sections">
-      <div class="batch-section">
-        <h3>${icon("clock")} Scheduling</h3>
-        ${kvline("Start time", c.start_time ? fmtDate(c.start_time) : "—")}
-        ${kvline("End time", c.end_time ? fmtDate(c.end_time) : "—")}
-        ${kvline("Daily window", (c.daily_start_time && c.daily_end_time) ? c.daily_start_time + " – " + c.daily_end_time : "—")}
-      </div>
-      <div class="batch-section">
-        <h3>${icon("refresh")} Retries</h3>
-        ${kvline("Retry enabled", c.retry_enabled ? `<span class="tagchip on">Enabled</span>` : `<span class="tagchip off">Disabled</span>`)}
-        ${kvline("Max retries", c.max_retries ?? "—")}
-        ${kvline("Pending retries", (c.pending_retries || 0) + " calls")}
-      </div>
-      <div class="batch-section">
-        <h3>${icon("sliders")} Configuration</h3>
-        ${kvline("Max concurrent calls", c.max_concurrent_calls ?? "—")}
-        ${kvline("Pickup rate", c.pickup_rate != null ? c.pickup_rate.toFixed(1) + "%" : "—")}
-        ${kvline("Collection rate", c.collection_rate != null ? c.collection_rate.toFixed(1) + "%" : "—")}
-      </div>
+      ${statCard("Numbers", "phone-call", p.total, "In this batch", "accent")}
+      ${statCard("Placed", "check-circle", p.placed, "Calls triggered", "good")}
+      ${statCard("Calling", "phone", p.calling, "In progress", "warn")}
+      ${statCard("Failed", "x-circle", p.failed, p.failed ? "See rows below" : "No failures", "bad")}
+      ${statCard("Pending", "clock", pending < 0 ? 0 : pending, "Not yet dialed", "")}
     </div>
 
     ${followupSectionHtml(c.id)}
 
+    <div class="batch-section" style="margin-top:20px">
+      <h3>${icon("phone-call")} Contacts</h3>
+      <div class="table-scroll"><table class="data-table">
+        <tr><th>Number</th><th>Status</th><th>Detail</th></tr>${rows}
+      </table></div>
+    </div>
+
     <div class="actionbar" id="batchActions" style="border-top:none"></div>`;
 
-  // Credits used = sum of placed-call costs isn't available; show total cost if present
-  $("#batchCredits").textContent = c.total_cost != null ? Number(c.total_cost).toFixed(2) : "0.00";
+  $("#batchCredits").textContent = String(p.placed);
 
   const ba = $("#batchActions");
-  const reload = () => openBatch(c.id);
-  if (c.status === "in_progress" || c.status === "pending")
-    ba.appendChild(btn("Pause", "", () => act(c.id, "pause", reload), "pause"));
-  else if (c.status === "paused")
-    ba.appendChild(btn("Resume", "", () => act(c.id, "resume", reload), "play"));
-  if (["in_progress", "pending", "paused"].includes(c.status))
-    ba.appendChild(btn("Stop", "btn-danger", () => { if (confirm("Stop this campaign?")) act(c.id, "stop", reload); }, "stop"));
-  ba.appendChild(btn("Refresh", "", reload, "refresh"));
+  if (c.dialing) ba.appendChild(btn("Pause dialing", "", () => stopDialing(c.id), "pause"));
+  else if (p.placed + p.failed < p.total) ba.appendChild(btn(p.placed + p.failed > 0 ? "Resume dialing" : "Start calling", "", () => startDialing(c.id), "play"));
+  ba.appendChild(btn("Refresh", "", () => openBatch(c.id), "refresh"));
 
   hydrateIcons($("#batchBody"));
-  $("#batchBody").querySelectorAll("[data-copy]").forEach(b =>
-    b.addEventListener("click", () => { navigator.clipboard.writeText(b.dataset.copy); toast("Copied ID", "ok"); }));
 }
 function kvline(k, v) { return `<div class="kvline"><span class="k">${k}</span><span class="v">${v}</span></div>`; }
 
-function followupSectionHtml(campaignId) {
-  const cfg = loadFollowupStore()[campaignId];
+function followupSectionHtml(batchId) {
+  const cfg = loadFollowupStore()[batchId];
   if (!cfg || !cfg.rules || !cfg.rules.length) return "";
   const rows = cfg.rules.map(r => `
     <div class="fu-summary"><span class="fu-ic">${icon("corner-up-right")}</span>
       <div>When <b>${escapeHtml(r.field)}</b> ${escapeHtml(opLabel(r.operator))}${r.value ? ` <b>${escapeHtml(r.value)}</b>` : ""},
-      call within <b>${r.delay} ${escapeHtml(r.unit)}</b> with <b>${escapeHtml(r.followup_agent_name || "agent")}</b>.</div>
+      call within <b>${r.delay} ${escapeHtml(r.unit)}</b> via IVR <b>${escapeHtml(cfg.followup_ivr || "—")}</b> on <b>${escapeHtml(cfg.followup_sr || "—")}</b>.</div>
     </div>`).join("");
   return `
     <div class="batch-section" style="margin-top:20px">
-      <h3>${icon("corner-up-right")} Follow-up Rules</h3>
+      <h3>${icon("corner-up-right")} Follow-up Rule</h3>
       ${rows}
-      <p class="hint" style="margin-top:10px">${icon("clock")} Evaluated from Call History after each call completes — see the Follow-ups tab.</p>
+      <p class="hint" style="margin-top:10px">${icon("clock")} Evaluated from Levrage Call History after each call's PCA — see the Follow-ups tab.</p>
     </div>`;
 }
 
@@ -1233,5 +1288,4 @@ setInterval(() => { if (state.token && Object.keys(loadFollowupStore()).length) 
    ============================================================ */
 hydrateIcons();
 $("#fuArm").checked = isArmed();
-normalizeFollowupStore();   // collapse any stale/duplicate follow-up configs on load
 if (state.token) loadAgents();

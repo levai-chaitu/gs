@@ -63,6 +63,32 @@
           </div>
 
           <div class="card">
+            <h2><span class="card-ic" data-icon="phone-call"></span> Call Routing (Knowlarity)</h2>
+            <p class="hint">Calls are placed via Knowlarity's OTP API. The batch numbers connect to the batch IVR; interested customers are re-dialed into the follow-up IVR.</p>
+            <div class="field">
+              <span class="lbl">Batch SR Number (k_number)</span>
+              <input id="c_batch_sr" type="text" placeholder="+918044927353" value="+918044927353" />
+              <small class="hint">SR/virtual number used to place the initial batch calls (E.164).</small>
+            </div>
+            <div class="field">
+              <span class="lbl">Batch IVR ID</span>
+              <input id="c_batch_ivr" type="text" placeholder="1000138983" value="1000138983" />
+              <small class="hint">IVR the customer connects to on the initial call.</small>
+            </div>
+            <hr class="sep" />
+            <div class="field">
+              <span class="lbl">Follow-up SR Number (k_number)</span>
+              <input id="c_fu_sr" type="text" placeholder="+918037112196" value="+918037112196" />
+              <small class="hint">A different SR number (follow-up agent) used for the follow-up call.</small>
+            </div>
+            <div class="field">
+              <span class="lbl">Follow-up IVR ID</span>
+              <input id="c_fu_ivr" type="text" placeholder="1000140098" value="1000140098" />
+              <small class="hint">IVR the customer connects to when they're interested.</small>
+            </div>
+          </div>
+
+          <div class="card">
             <h2><span class="card-ic" data-icon="upload"></span> File &amp; Schedule</h2>
             <div class="field">
               <span class="lbl">Upload CSV or Excel File</span>
@@ -78,7 +104,7 @@
               <select id="c_phone_column"><option value="">Select column containing phone numbers</option></select>
               <small class="hint">Select the column that contains the phone numbers to call</small>
             </div>
-            <div class="field">
+            <div class="field" style="display:none">
               <span class="lbl">Schedule Time (Optional)</span>
               <div class="row2">
                 <input id="c_sched_date" type="date" />
@@ -163,8 +189,8 @@
       <div class="actionbar">
         <span id="createMsg" class="msg"></span>
         <button id="cancelBtn" class="btn btn-ghost">Cancel</button>
-        <button id="startNowBtn" class="btn btn-outline" disabled>Start Now</button>
-        <button id="scheduleBtn" class="btn btn-outline" disabled>Schedule Later</button>
+        <button id="scheduleBtn" class="btn btn-outline" disabled>Create (dial later)</button>
+        <button id="startNowBtn" class="btn btn-primary" disabled>Create &amp; Start Calling</button>
       </div>
     </main>
 
