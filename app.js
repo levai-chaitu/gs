@@ -16,7 +16,7 @@ const SOURCE_NUMBERS = ["+13057034997", "00919240012505"]; // selectable source/
 // directly — otpcall's CORS preflight returns 403). See api/call.js.
 const KNOWLARITY_PROXY = "/api/call";
 const GAP_BETWEEN_CALLS_MS = 4000; // pause between manual batch dials (Knowlarity rate-limits / 429s rapid calls)
-const FOLLOWUP_LOOKBACK_MS = 5 * 60 * 1000; // follow-up scan only considers calls from the last 5 minutes
+const FOLLOWUP_LOOKBACK_MS = 10 * 60 * 1000; // follow-up scan only considers calls from the last 10 minutes
 
 // Hardcoded follow-up rule: as soon as PCA marks interested_to_take_loan == yes,
 // place the follow-up call (delay 0 — purely PCA-driven, no artificial wait).
@@ -624,12 +624,16 @@ async function scanFollowups() {
       // Link the call to a batch: same Karn agent + the number was in THIS batch's
       // dialed list + the call happened after the batch was created. The phone-list
       // match ensures we never follow up organic (non-batch) calls by the same agent.
-      const cid = ids.find(id => {
+      // When the same number is in multiple batches, attribute to the MOST RECENT
+      // batch created before this call (so re-testing in a new batch fires again).
+      let cid = null, cidCreated = "";
+      for (const id of ids) {
         const cfg = configs[id];
-        if (cfg.batch_agent_id && cfg.batch_agent_id !== call.agent_id) return false;
-        if (cfg.created_at && new Date(call.started_at) < new Date(cfg.created_at)) return false;
-        return Array.isArray(cfg.phones) && cfg.phones.includes(phone);
-      });
+        if (cfg.batch_agent_id && cfg.batch_agent_id !== call.agent_id) continue;
+        if (cfg.created_at && new Date(call.started_at) < new Date(cfg.created_at)) continue;
+        if (!(Array.isArray(cfg.phones) && cfg.phones.includes(phone))) continue;
+        if (!cid || (cfg.created_at || "") > cidCreated) { cid = id; cidCreated = cfg.created_at || ""; }
+      }
       if (!cid) continue;
       const cfg = configs[cid];
       const key = `${call.id}::fu`;
