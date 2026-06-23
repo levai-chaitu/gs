@@ -599,14 +599,21 @@ async function scanFollowups() {
   try {
     // Only pull calls from the last 5 minutes — never sweep the whole history
     // (so we don't "catch up" and fire follow-ups for old calls).
+    // direction=inbound: otpcall->IVR->agent calls land in Levrage as `inbound`
+    // (the IVR dials INTO the agent), NOT outbound. We further scope by the Karn
+    // agent + the batch's dialed phone list so no unrelated call can match.
     const since = new Date(Date.now() - FOLLOWUP_LOOKBACK_MS).toISOString();
-    const path = "/calls?page=1&page_size=100&direction=outbound&from_date=" + encodeURIComponent(since);
+    const path = "/calls?page=1&page_size=100&direction=inbound&from_date=" + encodeURIComponent(since);
     const res = await api(path);
     const calls = res.data || [];
     const runs = loadRuns();
     const rule = HARDCODED_FOLLOWUP_RULES[0];   // single global rule
     // Every call id that already has a run (any status / any old key) → never handle again.
     const handledCallIds = new Set(Object.values(runs).map(r => r.callId));
+    // Per-batch + per-number guard: each customer is followed up at most ONCE per
+    // batch. Prevents an endless loop where the follow-up call itself comes back as
+    // another interested inbound call and re-triggers.
+    const followedPhones = new Set(Object.values(runs).map(r => `${r.campaignId}::${normPhone(r.phone)}`));
     for (const call of calls) {
       if (call.status !== "completed" || !call.details_collection) continue;
       if (handledCallIds.has(call.id)) continue;   // dedup per call, even across old keys
@@ -627,6 +634,7 @@ async function scanFollowups() {
       const cfg = configs[cid];
       const key = `${call.id}::fu`;
       if (runs[key]) continue;
+      if (followedPhones.has(`${cid}::${phone}`)) continue;   // already followed up this number in this batch
       if (!matchesCondition(call.details_collection, rule)) continue;
       const base = new Date(call.ended_at || call.started_at).getTime();
       runs[key] = {
@@ -637,6 +645,7 @@ async function scanFollowups() {
         summary: call.call_summary || "", collected: (call.details_collection.collected_values || {}),
         fireAt: base + delayMs(rule), status: "scheduled",
       };
+      followedPhones.add(`${cid}::${phone}`);   // don't double-fire within one scan
     }
     saveRuns(runs);
     await processDue();
