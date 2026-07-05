@@ -245,6 +245,7 @@ function showView(name, { sidebar } = {}) {
 $$(".side-item").forEach(item => {
   item.addEventListener("click", () => {
     showView(item.dataset.view);
+    if (item.dataset.view === "create" && state.token && !state.agents.length) loadAgents();
     if (item.dataset.view === "list") loadCampaigns();
     if (item.dataset.view === "calls") loadCalls();
     if (item.dataset.view === "followups") { renderFollowups(); scanFollowups(); }
